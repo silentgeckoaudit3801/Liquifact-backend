@@ -1842,3 +1842,7 @@ The feature flag wiring lives in whichever bootstrap file initialises the queue
 
 ## License
 MIT (see root LiquiFact project for full license).
+
+## Documentation
+
+- [Request lifecycle and middleware order](docs/request-lifecycle-middleware-order.md) documents the Express bootstrap sequence, feature-router stack order, and funding request gates.

@@ -1,83 +1,115 @@
 # Request lifecycle and middleware order
 
-This document describes how incoming HTTP requests flow through the LiquiFact
-Express application and the intended order of global middleware and feature-router
-mounts in [`src/app.js`](../src/app.js).
+This document is the code-accurate request lifecycle for the LiquiFact Express app assembled in [`src/app.js`](../src/app.js) and the reusable stacks in [`src/middleware/stacks.js`](../src/middleware/stacks.js). The order is intentionally load-bearing: request identifiers must exist before logging, sanitization/body limits must run before validators and route handlers, authentication must run before tenant extraction, and funding gates must run before any fund submission side effect.
 
-## Global middleware (every request)
+## Global bootstrap order
 
-Applied in this order before any route handler runs:
+`createStandardizedApp()` first wraps `res.json` so responses can be converted into the shared response envelope, then delegates to the raw app returned by `createApp()`. Inside `createApp()`, every request reaches middleware and routes in this order:
 
-| Step | Middleware | Purpose |
-|------|------------|---------|
-| 1 | CORS (`createCorsOptions`) | Environment-driven origin allowlist |
-| 1.a | Raw body parser (`/api/kyc/webhook` only) | Provider webhook signature verification |
-| 2 | JSON body limit | Global JSON payload guardrail (100 KB) |
-| 3 | URL-encoded body limit | Form payloads (50 KB) |
-| 4 | Security headers (`createSecurityMiddleware`) | Helmet-style hardening |
-| 5 | Audit middleware | Structured request audit trail |
-| 6 | Request ID | Resolves the canonical request identifier from `X-Request-Id`, `request-id`, or `X-Correlation-Id`, then attaches it to both `req.id` and `req.correlationId` for logging |
-| 7 | Correlation ID | Echoes the canonical identifier in `X-Correlation-Id` and refreshes the request-scoped logger bindings |
+| Order | Code | Applies to | Purpose and ordering constraint |
+| --- | --- | --- | --- |
+| 1 | `cors(createCorsOptions())` | All requests | Rejects blocked origins before body parsing or route work. CORS rejection is later mapped by `handleCorsError`. |
+| 2 | `express.raw({ type: "application/json", limit: "100kb" })` on `/api/kyc/webhook` | KYC webhook only | Preserves the raw provider payload for signature verification before the global JSON parser consumes the stream. |
+| 3 | `...jsonBodyLimit()` | All JSON requests | Applies the default JSON payload limit before route validators inspect `req.body`. |
+| 4 | `...urlencodedBodyLimit()` | URL-encoded requests | Applies the default form-body limit before route handlers. |
+| 5 | `createSecurityMiddleware()` | All requests | Applies Helmet-style security headers early so normal and error responses carry the same hardening headers. |
+| 6 | `auditMiddleware` | All requests | Starts request audit capture before IDs and feature routers add more context. |
+| 7 | `requestId` | All requests | Validates `X-Request-Id`/`Request-Id`, attaches `req.id`, creates a request logger, and echoes `X-Request-Id`. |
+| 8 | `correlationIdMiddleware` | All requests | Validates or generates `req.correlationId`, refreshes the request logger with correlation data, and echoes `X-Correlation-Id`. |
+| 9 | Inline health/API/invoice/escrow routes | Matching routes | Handles `/health`, `/healthz`, `/ready`, `/readyz`, `/api`, `/api/invoices`, `/api/escrow/:invoiceId`, and test error routes before feature routers. |
+| 10 | `mountFeatureRouter(...)` calls | Feature routes | Mounts imported routers exactly once and preserves the feature-router order listed below. |
+| 11 | `assertNoDuplicateRouterMounts()` | Startup check | Fails bootstrap if a feature router is mounted in an unsafe duplicate pattern. |
+| 12 | `/metrics` with `metricsAuth, metricsHandler` | Metrics route | Keeps Prometheus metrics behind its own auth after feature-router registration. |
+| 13 | 404 catch-all | Unmatched requests | Returns `{ error: "Not found", path }` after all known routes have had a chance to match. |
+| 14 | `handleCorsError` | Error path | Converts the dedicated blocked-origin CORS error to a 403 JSON response. |
+| 15 | `payloadTooLargeHandler` | Error path | Converts body-parser limit errors to 413 JSON after the parsers have raised them. |
+| 16 | `handleInternalError` | Error path | Maps parse failures and `AppError` 4xx responses, then emits generic 500 responses for uncaught errors. |
 
-## Request identifier header contract
+## Feature-router mount order
 
-The identifier pipeline accepts a client-supplied request or correlation header only when it is 8 to 64 characters long and contains only the safe characters `[A-Za-z0-9_-]`. Values with dots, control characters, newlines, whitespace, or other disallowed bytes are rejected. `X-Request-Id` and `request-id` take precedence over `X-Correlation-Id` when multiple valid headers are present. The sanitized value is attached to both `req.id` and `req.correlationId`, propagated into child loggers as `requestId` and `correlationId`, and echoed in `X-Request-Id` and `X-Correlation-Id`. If no inbound identifier is trusted, the server generates a full-strength `req_` identifier from UUID entropy.
+The feature routers are mounted in this exact order after the inline routes and before `/metrics`:
 
-## Body Size Limits
+1. `/api/sme` -> `smeRoutes`
+2. `/api/invoices` -> `invoiceFileRoutes`
+3. `/api/invoices` -> `invoiceStateRoutes`
+4. `/api/invest` -> `investRoutes`
+5. `/api/investor` -> `investorRoutes`
+6. `/api/kyc` -> `kycRoutes`
+7. `/api/marketplace` -> `marketplaceRoutes`
+8. `/api/retention` -> `retentionRoutes`
+9. `/api/admin/audit` -> `auditTrailRoutes`
+10. `/api/admin/escrow` -> `adminEscrowRoutes`
+11. `/api/admin/reconciliation` -> `reconciliationRoutes`
+12. `/v1` -> `v1Routes`
 
-The JSON, URL-encoded, and invoice body guards reject requests early when a
-trustworthy `Content-Length` declares a body larger than the configured limit.
-Requests without a valid `Content-Length`, including `Transfer-Encoding:
-chunked`, are not treated as zero-byte bodies. They continue into the Express
-body parser, which enforces the same byte cap without buffering beyond its
-configured limit. Parser-raised 413 responses reuse the guard's stored limit
-context so `bodySizeLimitRejectionsTotal` keeps the correct `json`,
-`urlencoded`, or `invoice` label.
+`mountFeatureRouter` allows distinct routers to share a base path where that is intentional, such as the two `/api/invoices` routers. The investor router is called out in `src/app.js` because it must not be mounted twice; duplicate mounts are rejected by `assertNoDuplicateRouterMounts()`.
 
-## Inline routes (defined on `app` directly)
+## Reusable middleware stacks
 
-Health probes (`/health`, `/healthz`, `/ready`, `/readyz`), API info (`/api`),
-invoice list/create, escrow read, and debug error routes are registered on the
-app instance before feature routers mount.
+[`src/middleware/stacks.js`](../src/middleware/stacks.js) defines two shared stacks:
 
-## Feature router mounts (single mount per router instance)
+| Stack | Order | Used for | Why the order matters |
+| --- | --- | --- | --- |
+| `authenticatedTenantStack` | `authenticateToken` -> `extractTenant` | JWT-protected tenant routes such as `src/routes/invest.js` | `extractTenant` depends on the authenticated user context established by `authenticateToken`; reversing the order would allow tenant logic to run without a verified principal. |
+| `adminStack` | `adminAuth` -> `extractTenant` | Admin routers | `adminAuth` accepts either `X-API-Key` via `authenticateApiKey()` or a Bearer JWT via `authenticateToken`, then tenant extraction runs after the admin identity has been accepted. |
 
-Each feature router is imported once and mounted once via
-`mountFeatureRouter` from [`src/utils/routeMountRegistry.js`](../src/utils/routeMountRegistry.js).
-A startup assertion (`assertNoDuplicateRouterMounts`) fails fast if the same
-router instance is mounted twice at the same base path.
+## `POST /api/invest/fund-invoice`
 
-Mount order (preserved intentionally):
+The representative funding request has both the global app chain and the route-local chain:
 
-| Order | Base path | Router module | Notes |
-|-------|-----------|---------------|-------|
-| 1 | `/api/sme` | `routes/sme` | SME metrics and uploads |
-| 2 | `/api/invoices` | `routes/invoiceFile` | File upload handlers |
-| 3 | `/api/invoices` | `routes/invoiceStateRoutes` | State machine (second router, different instance) |
-| 4 | `/api/invest` | `routes/invest` | Funding opportunities and fund-invoice |
-| 5 | `/api/investor` | `routes/investor` | **Single mount** — investor lock list/detail |
-| 6 | `/api/kyc` | `routes/kyc` | KYC verification |
-| 7 | `/api/marketplace` | `routes/marketplace` | Investable invoice marketplace |
-| 8 | `/api/retention` | `routes/retention` | Data retention policies |
-| 9 | `/api/admin/audit` | `routes/auditTrail` | Admin audit trail |
-| 10 | `/api/admin/escrow` | `routes/adminEscrow` | Admin escrow tooling |
-| 11 | `/api/admin/reconciliation` | `routes/reconciliation` | Reconciliation runs |
-| 12 | `/v1` | `routes/v1` | Versioned API surface |
+1. Global CORS, body limits, security, audit, request ID, and correlation ID middleware run first.
+2. `/api/invest` dispatches to `investRoutes`.
+3. `router.use(...authenticatedTenantStack)` runs `authenticateToken` and then `extractTenant` for every invest route.
+4. `router.post("/fund-invoice", requireKycForFunding, idempotencyMiddleware, asyncHandler(...))` runs the funding-specific gate sequence.
+5. The handler validates `invoiceId`, `investorAddress`, and `amountStroops` from the already-parsed body.
+6. The handler invokes `legalHoldGate()` before any Soroban network mutation or commitment persistence.
+7. If the legal-hold gate sends a response, the handler stops immediately; otherwise it builds the deterministic idempotency key, submits funding through the service layer, and persists the commitment with that key.
+8. Rejections or thrown errors flow to the error handlers, where CORS and payload-size errors are handled first and remaining application errors are mapped by `handleInternalError`.
 
-> **Investor routes:** `/api/investor` is mounted exactly once. The investor
-> router applies `authenticateToken` then `extractTenant` on each handler, so
-> auth and tenant context are enforced before lock list or detail logic runs.
+```mermaid
+sequenceDiagram
+    participant Client
+    participant App as createStandardizedApp/createApp
+    participant Global as Global middleware
+    participant Invest as investRoutes
+    participant Gates as KYC/idempotency/legal-hold gates
+    participant Handler as fund-invoice handler
+    participant Errors as error handlers
 
-## Post-route middleware
+    Client->>App: POST /api/invest/fund-invoice
+    App->>Global: wrap res.json, then raw app
+    Global->>Global: CORS -> JSON/urlencoded limits -> security -> audit
+    Global->>Global: requestId -> correlationId
+    Global->>Invest: mountFeatureRouter('/api/invest', investRoutes)
+    Invest->>Invest: authenticateToken -> extractTenant
+    Invest->>Gates: requireKycForFunding
+    Gates->>Gates: idempotencyMiddleware
+    Gates->>Handler: validate invoiceId/investorAddress/amountStroops
+    Handler->>Gates: legalHoldGate()
+    alt blocked by legal hold
+        Gates-->>Client: gate response, handler stops
+    else accepted
+        Handler->>Handler: build deterministic idempotency key
+        Handler->>Handler: submit funding and persist commitment
+        Handler-->>Client: success JSON envelope
+    end
+    Global-->>Errors: thrown/rejected errors
+    Errors->>Errors: handleCorsError -> payloadTooLargeHandler -> handleInternalError
+    Errors-->>Client: mapped JSON error
+```
 
-| Step | Handler | Purpose |
-|------|---------|---------|
-| Metrics | `GET /metrics` | Prometheus scrape (auth-gated) |
-| 404 | Catch-all | Unknown paths |
-| Error | CORS → payload-too-large → internal | Ordered error normalization |
+## Route-specific limits and stricter stacks
 
-## Standardized response envelope
+- `/api/kyc/webhook` opts into `express.raw({ type: "application/json", limit: "100kb" })` before the global JSON parser so webhook verification can use the raw body.
+- The global JSON and URL-encoded parsers come from `jsonBodyLimit()` and `urlencodedBodyLimit()` in [`src/middleware/bodySizeLimits.js`](../src/middleware/bodySizeLimits.js).
+- `POST /api/invoices` adds `...invoiceBodyLimit()` on top of the global chain before validating `invoiceCreateSchema`.
+- Feature routers can add their own auth, tenant, KYC, legal-hold, idempotency, rate-limit, or API-key middleware internally. Those route-local checks run only after the global app middleware and only for matched router paths.
+- `metricsAuth` protects `/metrics` outside the feature-router set.
 
-Production entry points use `createStandardizedApp()`, which wraps `createApp()`
-and normalizes JSON responses through `toStandardEnvelope`. Route order inside
-`createApp()` is unchanged; only the outer response wrapper is added.
+## Security-critical invariants
+
+- Body-size limits must run before route validators and persistence code so oversized payloads fail at the parser layer.
+- Sanitization and schema validation must happen before route handlers trust client-controlled body, query, or params. Routes that perform their own validators, such as `validateInvoiceQueryParams` and `invoiceCreateSchema`, rely on the body/query already being parsed and bounded.
+- `authenticateToken` must run before `extractTenant` in tenant-scoped stacks.
+- `requireKycForFunding`, `idempotencyMiddleware`, and `legalHoldGate()` must all run before the funding handler performs Soroban submission or commitment persistence.
+- Error handlers must remain last so normal routers can throw or call `next(err)` and still receive the CORS, payload-size, and internal-error mapping behavior.
