@@ -1,4 +1,4 @@
-/**
+﻿/**
  * src/services/investorCommitment.js
  *
  * Persists investor commitment records produced by the fund-invoice flow.
@@ -350,9 +350,12 @@ function seedInvestorLocks() {
 }
 
 module.exports = {
+  CommitmentValidationError,
+  MAX_STROOP_AMOUNT,
   persistCommitment,
   updateCommitment,
   findCommitments,
+  validateAmountStroops,
   validateAddress,
   setInvestorLock,
   getInvestorLock,
