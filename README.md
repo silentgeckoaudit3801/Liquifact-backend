@@ -1,4 +1,4 @@
-# LiquiFact Backend
+﻿# LiquiFact Backend
 //Comment
 API gateway and server for LiquiFact, the global invoice liquidity network on Stellar. This repo provides the Express-based REST API for invoice uploads, escrow state, and future Stellar integration.
 
@@ -1383,7 +1383,9 @@ The backend supports durable idempotency keys for funding operations to safely r
 
 ### Amount validation
 
-`amountStroops` is the on-chain principal unit. The service enforces strict format rules **before any database write**:
+`amountStroops` is the on-chain principal unit. The `POST /api/invest/fund-invoice` route and the
+commitment service share the same validator, so the request is rejected **before Soroban submission
+or any database write** when the amount is not canonical:
 
 | Rule | Detail |
 |------|--------|
