@@ -1,4 +1,4 @@
-/**
+﻿/**
  * src/routes/invest.js
  *
  * Routes:
@@ -26,7 +26,11 @@ const { requireKycForFunding } = require('../middleware/kycGating');
 const { legalHoldGate } = require('../middleware/legalHoldGate');
 const { resolveEscrowAddress, EscrowNotFoundError } = require('../config/escrowMap');
 const { submitFundEscrow, EscrowSubmitError } = require('../services/escrowSubmit');
-const { persistCommitment } = require('../services/investorCommitment');
+const {
+  CommitmentValidationError,
+  persistCommitment,
+  validateAmountStroops,
+} = require('../services/investorCommitment');
 const { listOpportunities } = require('../services/investService');
 const idempotencyMiddleware = require('../middleware/idempotency');
 const { isValidStellarAddress } = require('../utils/validators');
@@ -61,10 +65,16 @@ function validateFundInvoiceBody(body) {
     errors.push('investorAddress must be a valid Stellar public key (G... or C...).');
   }
 
-  // amountStroops: must be a positive integer (as number or numeric string)
-  const parsed = Number(amountStroops);
-  if (!amountStroops || !Number.isInteger(parsed) || parsed <= 0) {
-    errors.push('amountStroops must be a positive integer representing the fund amount in stroops.');
+  // amountStroops: strict positive integer string. Never coerce through Number,
+  // because stroop values can exceed Number.MAX_SAFE_INTEGER.
+  try {
+    validateAmountStroops(amountStroops);
+  } catch (err) {
+    if (err instanceof CommitmentValidationError) {
+      errors.push(err.message);
+    } else {
+      throw err;
+    }
   }
 
   return errors;
@@ -160,7 +170,7 @@ router.post(
       submitResult = await submitFundEscrow({
         escrowAddress,
         investorAddress,
-        amountStroops: String(amountStroops),
+        amountStroops,
         invoiceId,
       });
     } catch (err) {
@@ -182,7 +192,7 @@ router.post(
       invoiceId,
       investorAddress,
       escrowAddress,
-      amountStroops: String(amountStroops),
+      amountStroops,
       status: submitResult.status,
       unsignedXdr: submitResult.unsignedXdr,
       txHash: submitResult.txHash,
